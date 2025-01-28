@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# VSCode and other IDE settings
+.vscode/
+.idea/
+
+# Pytest cache
+.pytest_cache/
+
+# Logs
+*.log
+
+# Python environment files
+*.env
+.env.*
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# MacOS system files
+.DS_Store
+
+# Deployment artifacts
+*.sqlite3
+*.db
+*.bak
+
+# Miscellaneous
+*.swp
+*.swo
