@@ -23,7 +23,7 @@ frontend_url = os.getenv("FRONTEND_URL")
 
 # Allow CORS from frontend URL (and development URLs)
 origins = [
-    frontend_url,  # Production URL from environment variable
+    frontend_url,  
 ]
 
 # Add CORS middleware
