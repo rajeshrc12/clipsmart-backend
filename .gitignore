@@ -21,7 +21,6 @@ env/
 
 # Python environment files
 *.env
-.env.*
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
