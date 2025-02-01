@@ -2,7 +2,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
 from pydantic import BaseModel
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled
@@ -13,17 +13,30 @@ from moviepy.editor import VideoFileClip, concatenate_videoclips
 from datetime import timedelta
 import time
 import boto3
+from openai import OpenAI
+from deep_translator import GoogleTranslator
+from itertools import groupby
 # Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
-# Get the frontend URL from environment variables
+# Get environment variables
 frontend_url = os.getenv("FRONTEND_URL")
+bucket_name = os.getenv("AWS_BUCKET_NAME")
+region_name = os.getenv("AWS_REGION")
+aws_access_key_id = os.getenv("AWS_S3_ACCESS_KEY")
+aws_secret_access_key = os.getenv("AWS_S3_SECRET_KEY")
+youtube_api_key = os.getenv("YOUTUBE_API_KEY")
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI(api_key=openai_api_key)
+genai.configure(api_key=gemini_api_key)
 
 # Allow CORS from frontend URL (and development URLs)
 origins = [
-    frontend_url,  
+    frontend_url,
 ]
 
 # Add CORS middleware
@@ -35,377 +48,455 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+s3_client = boto3.client('s3', region_name=region_name,
+                         aws_access_key_id=aws_access_key_id,
+                         aws_secret_access_key=aws_secret_access_key)
+
+
+def get_prompt(transcription, user_prompt, language_code="en"):
+    print("Processing the prompt to extract relevant sections from the video transcript...")
+    language_prompt = ""
+    if (language_code != "en"):
+        language_prompt = f" User's prompt and Transcript is in non english language. So filter accordingly with proper language context and language code: {language_code} "
+    result = f"""
+You are an expert content reviewer. Below is a transcript of a video with index number, and the user has provided a specific prompt. Your task is to filter and extract the numbers of the transcript that are most relevant to the given prompt. When filtering, analyze groups of transcript entries (not just individual entries) and check for their overall relevance to the prompt. Avoid filtering based solely on a single entry and its direct match to the prompt. Instead, consider the broader context of related entries.{language_prompt}
+
+User's prompt: {user_prompt}
+
+Transcript:
+{transcription}
+
+Please return a JSON array below format
+[1,2,3,4....,N]
+Only return array of index.
+        """
+    print("Prompt processing completed.")
+    return result
 
 
 def seconds_to_hhmmss(seconds):
-    """Convert seconds to hh:mm:ss format."""
-    return str(timedelta(seconds=int(seconds)))
-
-
-def fetch_youtube_transcript(video_id):
     try:
-        # Fetch transcript
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        result = str(timedelta(seconds=int(seconds)))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to convert seconds to hh:mm:ss {str(e)}")
+    return result
 
-        # Create an array of objects with text, start_time, and end_time in hh:mm:ss format
-        transcript_array = []
-        for i, entry in enumerate(transcript):
+
+def get_video_id(video_url):
+    print("Extracting video ID from URL...")
+    try:
+        result = video_url.split("v=")[1].split("&")[0]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch video id {str(e)}")
+    print("Video ID extracted successfully.")
+    return result
+
+
+def get_video_details(video_id):
+    print("Fetching video details from YouTube API...")
+    try:
+        url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={youtube_api_key}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        if not data["items"]:
+            return False
+        video_snippet = data["items"][0]["snippet"]
+        result = {
+            "id": video_id,
+            "title": video_snippet["title"]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch video details {str(e)}")
+    print("Video details fetched successfully.")
+    return result
+
+
+def get_transcription_with_index(video_id, language_code="en"):
+    print("Retrieving transcription for the video...")
+    try:
+        youtube_transcription = YouTubeTranscriptApi.get_transcript(
+            video_id, languages=[language_code])
+        transcription_with_index = ""
+        transcription = []
+        for i, entry in enumerate(youtube_transcription):
+            text = entry["text"]
             start_time = entry["start"]
-            end_time = transcript[i + 1]["start"] if i + \
-                1 < len(transcript) else start_time + entry.get("duration", 0)
+            end_time = youtube_transcription[i + 1]["start"] if i + \
+                1 < len(youtube_transcription) else start_time + entry.get("duration", 0)
+            transcription.append({
+                "text": text,
+                "start_time": seconds_to_hhmmss(start_time),
+                "end_time": seconds_to_hhmmss(end_time)
+            })
+            transcription_with_index += f"{i+1}.[{seconds_to_hhmmss(start_time)}-{seconds_to_hhmmss(end_time)}] {text} \n"
+        print("Transcription retrieved successfully.")
+        return {"transcription": transcription, "transcription_with_index": transcription_with_index}
+    except:
+        return {"transcription": [], "transcription_with_index": ""}
+
+
+def get_transcription(video_id):
+    print("Retrieving transcription for the video...")
+    try:
+        transcription = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript_array = []
+        for i, entry in enumerate(transcription):
+            start_time = entry["start"]
+            end_time = transcription[i + 1]["start"] if i + \
+                1 < len(transcription) else start_time + entry.get("duration", 0)
             transcript_array.append({
                 "text": entry["text"],
                 "start_time": seconds_to_hhmmss(start_time),
                 "end_time": seconds_to_hhmmss(end_time)
             })
+        print("Transcription retrieved successfully.")
         return transcript_array
-
-    except TranscriptsDisabled:
-        return "Transcripts are disabled for this video."
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except:
+        print("Failed to retrieve transcription.")
+        return False
 
 
-def fetch_video_details(api_key, video_id):
-    url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={api_key}"
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data["items"]:
-        return {"error": "Video not found"}
-
-    video_snippet = data["items"][0]["snippet"]
-    return {
-        "id": video_id,
-        "title": video_snippet["title"]
-    }
-
-
-def fetch_playlist_videos(api_key, playlist_id):
-    url = f"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId={playlist_id}&maxResults=50&key={api_key}"
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-
-    videos = []
-    for item in data.get("items", []):
-        video_id = item["snippet"]["resourceId"]["videoId"]
-        video_title = item["snippet"]["title"]
-        videos.append({"id": video_id, "title": video_title})
-    return videos
-
-
-def call_gemini_api(api_key, transcript, user_prompt):
-    # Configure the API with your API key
-    genai.configure(api_key=api_key)
-
-    # Prepare the user prompt and the transcript content for the request
-    user_content = f"""
-    You are an expert content reviewer. Below is a transcript of a video, and the user has provided a specific prompt. Your task is to filter and extract the sections of the transcript that are most relevant to the given prompt.
-
-    When filtering, analyze groups of transcript entries (not just individual entries) and check for their overall relevance to the prompt. Avoid filtering based solely on a single entry's text and its direct match to the prompt. Instead, consider the broader context of related entries.
-
-    User's prompt: "{user_prompt}"
-
-    Transcript:
-    {json.dumps(transcript, ensure_ascii=False, indent=2)}
-
-    Please return a JSON array in below format
-    [
-        {{
-            "text": "The text of the transcript.",
-            "start_time": "The start time of the transcript in hh:mm:ss format.",
-            "end_time": "The end time of the transcript in hh:mm:ss format."
-        }},
-        ...
-    ]
-    Only return array.
-    """
-
-    # Call the Google Gemini API for content generation
-    response = genai.GenerativeModel(
-        "gemini-1.5-flash").generate_content(user_content)
-    print(response)
-    # Extract content between []
-    start = response.text.find('[') + 1
-    end = response.text.find(']')
-    content = response.text[start:end]
-
-    # Extract the response content (filtered transcript) from the model
+def create_transcription(video_id):
+    print("Creating a new transcription for the video...")
     try:
-        # Assuming response contains valid JSON
-        filtered_transcript = json.loads('[' + content + ']')
-    except json.JSONDecodeError:
-        filtered_transcript = []
 
-    return filtered_transcript
-
-
-def process_youtube_link(api_key, anthropic_key, url, user_prompt):
-    try:
-        if "list=" in url:  # Playlist link
-            playlist_id = url.split("list=")[1].split("&")[0]
-            videos = fetch_playlist_videos(api_key, playlist_id)
-            for video in videos:
-                transcript_data = fetch_youtube_transcript(video["id"])
-                filtered_transcript = call_gemini_api(
-                    anthropic_key, transcript_data, user_prompt)
-                video["filtered_transcript"] = filtered_transcript
-                # video["transcript_data"] = transcript_data
-            return videos
-
-        elif "v=" in url:  # Single video link
-            video_id = url.split("v=")[1].split("&")[0]
-            video_details = fetch_video_details(api_key, video_id)
-            if "error" in video_details:
-                return video_details
-            transcript_data = fetch_youtube_transcript(video_id)
-            filtered_transcript = call_gemini_api(
-                anthropic_key, transcript_data, user_prompt)
-            video_details["filtered_transcript"] = filtered_transcript
-            # video_details["transcript_data"] = transcript_data
-            return [video_details]
-
-        else:
-            return {"error": "Invalid YouTube link"}
-
+        print("Transcription creation completed.")
+        return []
     except Exception as e:
-        return {"error": f"An error occurred: {str(e)}"}
+        print("Transcription creation failed.")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create video transcription {str(e)}")
 
 
-def filter_transcripts(transcripts):
-    filtered_segments = []
-    start_time = None
-    end_time = None
-    print(transcripts)
-    for i in range(len(transcripts)):
-        current_segment = transcripts[i]
-        if start_time is None:
-            start_time = current_segment['start_time']
-
-        # Check if next segment is within 2 seconds
-        if i + 1 < len(transcripts):
-            next_segment = transcripts[i + 1]
-            current_end_time = convert_time_to_seconds(
-                current_segment['end_time'])
-            next_start_time = convert_time_to_seconds(
-                next_segment['start_time'])
-
-            if next_start_time - current_end_time <= 2:
-                continue  # Merge this segment with the next
-            else:
-                # Save the current segment as a separate clip
-                end_time = current_segment['end_time']
-                filtered_segments.append(
-                    {"start_time": start_time, "end_time": end_time})
-                start_time = None  # Reset start time for the next segment
-        else:
-            end_time = current_segment['end_time']
-            filtered_segments.append(
-                {"start_time": start_time, "end_time": end_time})
-
-    return filtered_segments
+def filter_using_openai(user_prompt):
+    print("Filtering transcription using OpenAI GPT...")
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[{
+                "role": "system", "content": "You are an expert content reviewer."
+            }, {
+                "role": "user", "content": user_prompt
+            }]
+        )
+        generated_text = response.choices[0].message.content
+        start = generated_text.find('[') + 1
+        end = generated_text.find(']')
+        content = generated_text[start:end]
+        try:
+            generated_text = json.loads('[' + content + ']')
+        except json.JSONDecodeError:
+            generated_text = False
+        print("OpenAI filtering completed.")
+        return generated_text
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to filter transcription using OpenAI {str(e)}")
 
 
-def convert_time_to_seconds(time_str):
-    if ':' in time_str:
-        time_parts = time_str.split(':')
-        if len(time_parts) == 2:
-            return int(time_parts[0]) * 60 + int(time_parts[1])
-        elif len(time_parts) == 3:
-            return int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
-    return 0
-
-
-def clip_video(video_id, video_title, timestamps):
-    if(len(timestamps)==0):
-        return
-    # Use the timestamp directly as the file name
-    video_file_name = f"{video_title}.mp4"
-
-    video_url = f'https://www.youtube.com/watch?v={video_id}'
-
-    # Set options for yt-dlp to download the video
-    ydl_opts = {
-        'format': 'worst',  # Download the best quality video and audio
-        'outtmpl': video_file_name,  # Output file name
-    }
-
-    # Download the video using yt-dlp
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
-
-    # Process the downloaded video file
-    clip = VideoFileClip(video_file_name)
-
-    # Create subclips based on timestamps
-    subclips = []
-    for timestamp in timestamps:
-        # Extract start_time and end_time
-        start_time = timestamp["start_time"]
-        end_time = timestamp["end_time"]
-
-        # Convert timestamps to seconds
-        start_seconds = sum(int(x) * 60 ** i for i,
-                            x in enumerate(reversed(start_time.split(":"))))
-        end_seconds = sum(int(x) * 60 ** i for i,
-                          x in enumerate(reversed(end_time.split(":"))))
-
-        # Create a subclip
-        subclip = clip.subclip(start_seconds, end_seconds)
-        subclips.append(subclip)
-
-    # Combine all the subclips into a single video
-    combined_clip = concatenate_videoclips(subclips)
-
-    # Save the combined video to a file
-    output_file = f"{video_title}_clipped.mp4"
-    combined_clip.write_videofile(output_file, codec='libx264')
-
-    print(f"Video clipped and saved as {output_file}")
-
-
-def create_video(data):
-    video_name = []
-    # Generate current timestamp in milliseconds (rounded) as a string
-    
-    for video in data:
-        filtered_transcript = video["filtered_transcript"]
-        if not filtered_transcript:
-            continue
-        video_id = video["id"]
-        current_timestamp = str(round(time.time() * 1000))
-        video_name.append(current_timestamp)
-        video_title = current_timestamp
-        clip_video(video_id, video_title, filtered_transcript)
-
-    return video_name
+def filter_using_gemini(user_prompt):
+    print("Filtering transcription using Gemini AI...")
+    try:
+        response = genai.GenerativeModel(
+            "gemini-1.5-flash").generate_content(user_prompt)
+        start = response.text.find('[') + 1
+        end = response.text.find(']')
+        content = response.text[start:end]
+        try:
+            filtered_transcript = json.loads('[' + content + ']')
+        except json.JSONDecodeError as e:
+            filtered_transcript = False
+        print("Gemini filtering completed.")
+        return filtered_transcript
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to filter transcription using Gemini {str(e)}")
 
 
 def parse_time(time_str):
-    """Convert a time string (e.g., '0:00:06') to a timedelta object."""
-    h, m, s = map(int, time_str.split(":"))
-    return timedelta(hours=h, minutes=m, seconds=s)
+    try:
+        h, m, s = map(int, time_str.split(":"))
+        result = timedelta(hours=h, minutes=m, seconds=s)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Error parsing time: {str(e)}")
+    return result
 
 
-def combine_transcript(transcript):
-    """Group sequential transcript entries based on start and end times."""
-    grouped = []
-    current_group = None
+def group_transcription_with_index(transcription, index_array):
+    result = []
+    start = index_array[0]
+    end = index_array[0]
 
-    for entry in transcript:
-        start_time = parse_time(entry["start_time"])
-        end_time = parse_time(entry["end_time"])
-
-        if not current_group:
-            # Start a new group
-            current_group = {
-                "text": entry["text"],
-                "start_time": entry["start_time"],
-                "end_time": entry["end_time"]
-            }
+    # First, find the sequences
+    for i in range(1, len(index_array)):
+        if index_array[i] == index_array[i - 1] + 1:
+            end = index_array[i]
         else:
-            # Check if this entry is sequential
-            last_end_time = parse_time(current_group["end_time"])
-            if start_time == last_end_time:
-                # Extend the current group
-                current_group["text"] += " " + entry["text"]
-                current_group["end_time"] = entry["end_time"]
+            if start == end:
+                result.append(str(start))
             else:
-                # Save the current group and start a new one
-                grouped.append(current_group)
+                result.append(f"{start}-{end}")
+            start = index_array[i]
+            end = index_array[i]
+
+    # Add the last sequence or number
+    if start == end:
+        result.append(str(start))
+    else:
+        result.append(f"{start}-{end}")
+
+    # Now, process the sequences with transcription
+    processed_transcriptions = []
+
+    # Create a transcription dictionary for easy lookup
+    transcription_dict = {i + 1: transcription[i]
+                          for i in range(len(transcription))}
+
+    for sequence in result:
+        if '-' in sequence:
+            # Sequence: get the first and last elements
+            sequence_start, sequence_end = map(int, sequence.split('-'))
+
+            # Get the start_time from the transcription for the first index
+            start_time = transcription_dict[sequence_start]["start_time"]
+            # Get the end_time from the transcription for the last index
+            end_time = transcription_dict[sequence_end]["end_time"]
+
+            processed_transcriptions.append({
+                "start_time": start_time,
+                "end_time": end_time,
+            })
+        else:
+            # Single element: process normally
+            index = int(sequence)
+            processed_transcriptions.append({
+                "start_time": transcription_dict[index]["start_time"],
+                "end_time": transcription_dict[index]["end_time"],
+            })
+
+    return processed_transcriptions
+
+
+def group_transcription(transcription):
+    print("Grouping transcription based on timestamps...")
+    try:
+        grouped = []
+        current_group = None
+        for entry in transcription:
+            start_time = parse_time(entry["start_time"])
+            if not current_group:
                 current_group = {
                     "text": entry["text"],
                     "start_time": entry["start_time"],
                     "end_time": entry["end_time"]
                 }
-
-    # Append the last group
-    if current_group:
-        grouped.append(current_group)
-
-    return grouped
-
-
-def group_transcripts(data):
-    """Process an array of transcript objects, grouping each `filtered_transcript`."""
-    for item in data:
-        item["filtered_transcript"] = combine_transcript(
-            item["filtered_transcript"])
-    return data
-
-def save_to_json(data, filename):
-    try:
-        with open(filename, "w", encoding="utf-8") as json_file:
-            json.dump(data, json_file, ensure_ascii=False, indent=4)
-        print(f"Data successfully saved to {filename}")
+            else:
+                last_end_time = parse_time(current_group["end_time"])
+                if start_time == last_end_time:
+                    current_group["text"] += " " + entry["text"]
+                    current_group["end_time"] = entry["end_time"]
+                else:
+                    grouped.append(current_group)
+                    current_group = {
+                        "text": entry["text"],
+                        "start_time": entry["start_time"],
+                        "end_time": entry["end_time"]
+                    }
+        if current_group:
+            grouped.append(current_group)
+        print("Transcription grouping completed.")
+        return grouped
     except Exception as e:
-        print(f"Error saving to JSON file: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to group transcription {str(e)}")
 
-region_name = os.getenv("AWS_REGION")
-aws_access_key_id = os.getenv("AWS_S3_ACCESS_KEY")
-aws_secret_access_key = os.getenv("AWS_S3_SECRET_KEY")
 
-s3_client = boto3.client('s3', region_name=region_name, 
-                         aws_access_key_id=aws_access_key_id, 
-                         aws_secret_access_key=aws_secret_access_key)
+def get_random_name_with(ext=""):
+    if (ext != ""):
+        result = f"{str(round(time.time() * 1000))}.{ext}"
+    else:
+        result = str(round(time.time() * 1000))
+    return result
 
-def upload_to_s3(file_path, bucket_name, s3_path):
-    """Uploads the file to AWS S3 and returns a pre-signed URL."""
+
+def download_video(video_id):
+    print("Downloading video from YouTube...")
     try:
-        with open(file_path, 'rb') as f:
-            s3_client.upload_fileobj(f, bucket_name, s3_path)
+        video_name = get_random_name_with("mp4")
+        video_url = f'https://www.youtube.com/watch?v={video_id}'
+        ydl_opts = {
+            'format': 'worst',
+            'outtmpl': video_name,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+        print("Video downloaded successfully.")
+        return video_name
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to download {str(e)}")
 
-        # Generate a pre-signed URL (valid for 1 hour)
+
+def clip_and_combine_video(video_name, transcription):
+    print("Clipping and combining video segments...")
+    try:
+        clip = VideoFileClip(video_name)
+        subclips = []
+        for timestamp in transcription:
+            start_time = timestamp["start_time"]
+            end_time = timestamp["end_time"]
+            start_seconds = sum(int(x) * 60 ** i for i,
+                                x in enumerate(reversed(start_time.split(":"))))
+            end_seconds = sum(int(x) * 60 ** i for i,
+                              x in enumerate(reversed(end_time.split(":"))))
+            subclip = clip.subclip(start_seconds, end_seconds)
+            subclips.append(subclip)
+        combined_clip = concatenate_videoclips(subclips)
+        clipped_video_name = f"{video_name}_clipped.mp4"
+        combined_clip.write_videofile(
+            clipped_video_name,
+            codec="libx264",
+            preset="ultrafast",
+            threads=os.cpu_count(),
+            ffmpeg_params=["-bufsize", "500M"],
+            bitrate="1M",
+            logger=None  # Disables progress bar
+        )
+        print("Video clipping and combining completed.")
+        return clipped_video_name
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to clip and combine video {str(e)}")
+
+
+def create_video_link(video_name):
+    print("Creating video link for AWS S3 upload...")
+    try:
+        with open(video_name, 'rb') as f:
+            s3_client.upload_fileobj(f, bucket_name, video_name)
         presigned_url = s3_client.generate_presigned_url(
             'get_object',
-            Params={'Bucket': bucket_name, 'Key': s3_path},
-            ExpiresIn=3600  # URL expires in 1 hour
+            Params={'Bucket': bucket_name, 'Key': video_name},
+            ExpiresIn=3600
         )
-
-        print(f"Video uploaded successfully.")
-        print(f"Pre-signed URL: {presigned_url}")
-        return presigned_url  # Return the secure URL
-
+        print("Video link created successfully.")
+        return presigned_url
     except Exception as e:
-        print(f"Failed to upload video to S3: {e}")
-        return None
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create aws video url {str(e)}")
+
+
+def get_another_transcription_language_code(video_id):
+    print("Checking for available transcription languages...")
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        available_langauge = ""
+        for transcriptItem in transcript_list:
+            if transcriptItem.language_code:
+                available_langauge = transcriptItem.language_code
+                break
+        print("Available transcription language found.")
+        return available_langauge
+    except:
+        print("Failed to check transcription languages.")
+        return False
+
+
+def get_another_transcription(video_id, language_code):
+    print(f"Retrieving transcription in language code: {language_code}...")
+    try:
+        transcription = YouTubeTranscriptApi.get_transcript(
+            video_id, languages=[language_code])
+        print("Transcription retrieved in specified language.")
+        return transcription
+    except:
+        print("Failed to retrieve transcription.")
+        return False
+
+
+def convert_text(text, language_code):
+    print(f"Translating text to English from {language_code}...")
+    translator = GoogleTranslator(source=language_code, target="en")
+    result = translator.translate(text)
+    print("Text translation completed.")
+    return result
+
+
+def convert_transcription(transcription, language_code):
+    print(f"Converting transcription to English from {language_code}...")
+    try:
+        translator = GoogleTranslator(source=language_code, target="en")
+        converted_transcription = []
+        for entry in transcription:
+            translated_text = translator.translate(entry['text'])
+            converted_transcription.append({
+                'start_time': seconds_to_hhmmss(entry['start']),
+                'end_time': seconds_to_hhmmss(entry['start'] + entry['duration']),
+                'text': translated_text
+            })
+        print("Transcription conversion completed.")
+        return converted_transcription
+    except:
+        print("Failed to convert transcription.")
+        return False
+
 
 class VideoRequest(BaseModel):
     prompt_link: str
     prompt: str
+
+
 @app.post("/")
 async def process_video(video_request: VideoRequest):
-    youtube_url = video_request.prompt_link
+    video_url = video_request.prompt_link
     user_prompt = video_request.prompt
-    youtube_api_key = os.getenv("YOUTUBE_API_KEY")
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    result = process_youtube_link(youtube_api_key, gemini_api_key, youtube_url, user_prompt)
-    print(result)
-    filtered_data=group_transcripts(result)
+    video_id = get_video_id(video_url)
 
+    video_details = get_video_details(video_id)
+    if not video_details:
+        return {"status_code": 404, "message": "video not found"}
 
-    video_name = create_video(filtered_data)
+    transcription = []
+    transcription_with_index = []
+    language_code = "en"
 
-    clips=[]
-    print(video_name)
-    # Read each video file and add it to the clips list
-    for video in video_name:
-        clip = VideoFileClip(f"{video}_clipped.mp4")
-        clips.append(clip)
+    transcription_object = get_transcription_with_index(
+        video_id)
 
-    # # Concatenate all clips
-    edited_link=""
-    if(len(clips)>0):
-        print(len(clips),len(clips)>0)
-        final_clip = concatenate_videoclips(clips)
+    if transcription_object["transcription"]:
+        transcription = transcription_object["transcription"]
+        transcription_with_index = transcription_object["transcription_with_index"]
 
-        final_video_name=f"{str(round(time.time() * 1000))}_final_video.mp4"
-        # Save the combined video
-        final_clip.write_videofile(final_video_name, codec="libx264")
+    if not transcription_object["transcription"]:
+        language_code = get_another_transcription_language_code(video_id)
+        if language_code:
+            transcription_object = get_transcription_with_index(
+                video_id, language_code)
+            transcription = transcription_object["transcription"]
+            transcription_with_index = transcription_object["transcription_with_index"]
+        else:
+            transcription = create_transcription(video_id)
+            return {"status_code": 404, "message": "transcription not found"}
 
-        bucket_name = os.getenv("AWS_BUCKET_NAME")
-        edited_link=upload_to_s3(final_video_name,bucket_name,final_video_name)
+    user_prompt_with_transcription = get_prompt(
+        transcription_with_index, user_prompt, language_code)
+    index_array = filter_using_gemini(
+        user_prompt_with_transcription)
+    if not index_array:
+        return {"status_code": 404, "message": "transcription not found"}
 
-    return {"transcription": filtered_data, "edited_link":edited_link}
+    transcription = group_transcription_with_index(transcription, index_array)
+    video_name = download_video(video_id)
+    final_video_name = clip_and_combine_video(video_name, transcription)
+    video_link = create_video_link(final_video_name)
+    return {
+        "id": video_details["id"],
+        "title": video_details["title"],
+        "video_link": video_link,
+        "transcription": transcription,
+    }
