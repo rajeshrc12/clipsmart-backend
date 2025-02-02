@@ -15,7 +15,7 @@ import time
 import boto3
 from openai import OpenAI
 from deep_translator import GoogleTranslator
-from itertools import groupby
+import replicate
 # Load environment variables from .env file
 load_dotenv()
 
@@ -30,6 +30,7 @@ aws_secret_access_key = os.getenv("AWS_S3_SECRET_KEY")
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 openai_api_key = os.getenv("OPENAI_API_KEY")
+replicate_api_url = os.getenv("REPLICATE_API_URL")
 
 client = OpenAI(api_key=openai_api_key)
 genai.configure(api_key=gemini_api_key)
@@ -56,7 +57,7 @@ s3_client = boto3.client('s3', region_name=region_name,
 def get_prompt(transcription, user_prompt, language_code="en"):
     print("Processing the prompt to extract relevant sections from the video transcript...")
     language_prompt = ""
-    if (language_code != "en"):
+    if ("en" not in language_code.lower()):
         language_prompt = f" User's prompt and Transcript is in non english language. So filter accordingly with proper language context and language code: {language_code} "
     result = f"""
 You are an expert content reviewer. Below is a transcript of a video with index number, and the user has provided a specific prompt. Your task is to filter and extract the numbers of the transcript that are most relevant to the given prompt. When filtering, analyze groups of transcript entries (not just individual entries) and check for their overall relevance to the prompt. Avoid filtering based solely on a single entry and its direct match to the prompt. Instead, consider the broader context of related entries.{language_prompt}
@@ -160,16 +161,105 @@ def get_transcription(video_id):
         return False
 
 
-def create_transcription(video_id):
-    print("Creating a new transcription for the video...")
+def download_audio(video_id):
+    print("Downloading audio from YouTube...")
     try:
+        audio_name = get_random_name_with()
+        audio_url = f'https://www.youtube.com/watch?v={video_id}'
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',  # Change to 'wav' or 'm4a' if needed
+                'preferredquality': '192',
+            }],
+            # Save audio with title as filename
+            'outtmpl': f"{audio_name}.%(ext)s",
+        }
 
-        print("Transcription creation completed.")
-        return []
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([audio_url])
+        print("Audio downloaded successfully.")
+        return audio_name
     except Exception as e:
-        print("Transcription creation failed.")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to create video transcription {str(e)}")
+        return False
+
+
+def create_transcription_with_index_using_openai(audio_name):
+    print("Creating a new transcription using openai for the video...")
+    try:
+        audio_file = open(audio_name+".mp3", "rb")
+        result = client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-1",
+            response_format="verbose_json",
+            timestamp_granularities=["segment"]
+        )
+        print("create_transcription_with_index_using_openai", result)
+        transcription_with_index = ""
+        # Assuming transcription is an instance of TranscriptionVerbose
+        transcription = [
+            {
+                'start_time': seconds_to_hhmmss(segment.start),
+                'end_time': seconds_to_hhmmss(segment.end),
+                'text': segment.text.strip()
+            }
+            for segment in result.segments
+        ]
+        for i, entry in enumerate(transcription):
+            text = entry["text"]
+            start_time = entry["start_time"]
+            end_time = entry["end_time"]
+            transcription_with_index += f"{i+1}.[{start_time}-{end_time}] {text}\n"
+
+        print("Transcription creation completed using openai.")
+        return {"transcription": transcription, "transcription_with_index": transcription_with_index, "language_code": result.language}
+    except Exception as e:
+        print("Transcription creation failed using openai.", str(e))
+        return {"transcription": [], "transcription_with_index": "", "language_code": "en"}
+
+
+def create_transcription_with_index_using_replicate(audio_name):
+    print("Creating a new transcription using replicate for the video...", audio_name)
+    try:
+        transcription = []
+        audio = open(audio_name+".mp3", "rb")
+
+        input = {
+            "audio": audio,
+            "batch_size": 64
+        }
+
+        output = replicate.run(
+            replicate_api_url,
+            input=input
+        )
+        transcription_with_index = ""
+
+        for i, chunk in enumerate(output["chunks"]):
+            print("outside", chunk['timestamp'], type(chunk['timestamp']))
+            try:
+                if chunk['timestamp'] is not None and len(chunk['timestamp']) == 2:
+                    print("try", chunk['timestamp'][0], chunk['timestamp'][1])
+                    start_time = seconds_to_hhmmss(chunk['timestamp'][0])
+                    end_time = seconds_to_hhmmss(chunk['timestamp'][1])
+                    text = chunk['text']
+                    transcription.append({
+                        "text": text,
+                        "start_time": start_time,
+                        "end_time": end_time
+                    })
+                    transcription_with_index += f"{i+1}.[{start_time}-{end_time}] {text}\n"
+
+                else:
+                    print("Invalid timestamp:", chunk['timestamp'])
+            except Exception as e:
+                print("except", str(e))
+        print("Transcription creation completed using replicate.")
+        return {"transcription": transcription, "transcription_with_index": transcription_with_index}
+    except Exception as e:
+        print("Transcription creation failed using replicate.", str(e))
+        return {"transcription": [], "transcription_with_index": ""}
 
 
 def filter_using_openai(user_prompt):
@@ -459,7 +549,7 @@ async def process_video(video_request: VideoRequest):
 
     video_details = get_video_details(video_id)
     if not video_details:
-        return {"status_code": 404, "message": "video not found"}
+        return {"status_code": 404, "message": "Video not found", "error_code": "VNF"}
 
     transcription = []
     transcription_with_index = []
@@ -480,15 +570,24 @@ async def process_video(video_request: VideoRequest):
             transcription = transcription_object["transcription"]
             transcription_with_index = transcription_object["transcription_with_index"]
         else:
-            transcription = create_transcription(video_id)
-            return {"status_code": 404, "message": "transcription not found"}
+            audio_name = download_audio(video_id)
+            if not audio_name:
+                return {"status_code": 500, "message": "Failed to fetch audio.", "error_code": "FFA"}
+            transcription_object = create_transcription_with_index_using_openai(
+                audio_name)
+            transcription = transcription_object["transcription"]
+            transcription_with_index = transcription_object["transcription_with_index"]
+            language_code = transcription_object["language_code"]
+            if not transcription:
+                return {"status_code": 500, "message": "Failed to generate transcription.", "error_code": "FGT"}
 
     user_prompt_with_transcription = get_prompt(
         transcription_with_index, user_prompt, language_code)
+    print(user_prompt_with_transcription)
     index_array = filter_using_gemini(
         user_prompt_with_transcription)
     if not index_array:
-        return {"status_code": 404, "message": "transcription not found"}
+        return {"status_code": 404, "message": "Transcription not found", "error_code": "TNF"}
 
     transcription = group_transcription_with_index(transcription, index_array)
     video_name = download_video(video_id)
