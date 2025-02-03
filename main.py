@@ -256,10 +256,10 @@ def create_transcription_with_index_using_replicate(audio_name):
             except Exception as e:
                 print("except", str(e))
         print("Transcription creation completed using replicate.")
-        return {"transcription": transcription, "transcription_with_index": transcription_with_index}
+        return {"transcription": transcription, "transcription_with_index": transcription_with_index, "language_code": "en"}
     except Exception as e:
         print("Transcription creation failed using replicate.", str(e))
-        return {"transcription": [], "transcription_with_index": ""}
+        return {"transcription": [], "transcription_with_index": "", "language_code": "en"}
 
 
 def filter_using_openai(user_prompt):
@@ -585,7 +585,7 @@ async def process_video(video_request: VideoRequest):
             audio_name = download_audio(video_id)
             if not audio_name:
                 return {"status_code": 500, "message": "Failed to fetch audio.", "error_code": "FFA"}
-            transcription_object = create_transcription_with_index_using_openai(
+            transcription_object = create_transcription_with_index_using_replicate(
                 audio_name)
             transcription = transcription_object["transcription"]
             transcription_with_index = transcription_object["transcription_with_index"]
