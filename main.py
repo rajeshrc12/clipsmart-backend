@@ -351,6 +351,16 @@ def group_transcription_with_index(transcription, index_array):
         if '-' in sequence:
             # Sequence: get the first and last elements
             sequence_start, sequence_end = map(int, sequence.split('-'))
+            # Adjust start_index if it's not zero
+            start_index = sequence_start
+            end_index = sequence_end
+
+            # Adjust start_index if it's not zero
+            if start_index > 0:
+                start_index -= 1
+
+            text = " ".join(item["text"]
+                            for item in transcription[start_index:end_index-1])
 
             # Get the start_time from the transcription for the first index
             start_time = transcription_dict[sequence_start]["start_time"]
@@ -360,6 +370,7 @@ def group_transcription_with_index(transcription, index_array):
             processed_transcriptions.append({
                 "start_time": start_time,
                 "end_time": end_time,
+                "text": text
             })
         else:
             # Single element: process normally
@@ -367,6 +378,7 @@ def group_transcription_with_index(transcription, index_array):
             processed_transcriptions.append({
                 "start_time": transcription_dict[index]["start_time"],
                 "end_time": transcription_dict[index]["end_time"],
+                "text": transcription_dict[index]["text"]
             })
 
     return processed_transcriptions
@@ -588,7 +600,6 @@ async def process_video(video_request: VideoRequest):
         user_prompt_with_transcription)
     if not index_array:
         return {"status_code": 404, "message": "Transcription not found", "error_code": "TNF"}
-
     transcription = group_transcription_with_index(transcription, index_array)
     video_name = download_video(video_id)
     final_video_name = clip_and_combine_video(video_name, transcription)
