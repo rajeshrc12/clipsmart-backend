@@ -304,7 +304,7 @@ def filter_using_gemini(user_prompt):
         try:
             filtered_transcript = json.loads('[' + content + ']')
         except json.JSONDecodeError as e:
-            filtered_transcript = False
+            filtered_transcript = []
         print("Gemini filtering completed.")
         return filtered_transcript
     except Exception as e:
