@@ -456,14 +456,6 @@ def clip_and_combine_video(video_name, transcription):
         video_duration = clip.duration  # Get total duration
         subclips = []
 
-        # Get the last valid timestamp and floor it
-        if transcription:
-            last_valid_timestamp = transcription[-1]["end_time"]
-            last_valid_seconds = sum(
-                int(x) * 60 ** i for i, x in enumerate(reversed(last_valid_timestamp.split(":"))))
-            # Ensure it's within range
-            last_valid_seconds = max(0, math.floor(last_valid_seconds) - 1)
-
         for timestamp in transcription:
             start_time = timestamp["start_time"]
             end_time = timestamp["end_time"]
@@ -476,8 +468,8 @@ def clip_and_combine_video(video_name, transcription):
             # If end_seconds exceeds video duration, floor and subtract 1 second
             if end_seconds > video_duration:
                 print(
-                    f"End time {end_seconds} exceeds video duration {video_duration}. Adjusting to {last_valid_seconds}.")
-                end_seconds = last_valid_seconds
+                    f"End time {end_seconds} exceeds video duration {video_duration}. Adjusting to {video_duration}.")
+                end_seconds = video_duration - 1
 
             if start_seconds >= end_seconds:  # Avoid invalid cases
                 print(
@@ -675,9 +667,10 @@ async def process_video(video_request: VideoRequest):
 
         user_prompt_with_transcription = get_prompt(
             transcription_with_index, user_prompt, language_code)
-        print(user_prompt_with_transcription)
+
         index_array = filter_using_gemini(
             user_prompt_with_transcription)
+        print(user_prompt_with_transcription, index_array)
         if not index_array:
             continue
         transcription = group_transcription_with_index(
