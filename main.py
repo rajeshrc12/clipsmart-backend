@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled
 import json
 import google.generativeai as genai
 import yt_dlp
@@ -17,7 +16,6 @@ from openai import OpenAI
 from deep_translator import GoogleTranslator
 import replicate
 from urllib.parse import urlparse, parse_qs
-import math
 # Load environment variables from .env file
 load_dotenv()
 
