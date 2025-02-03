@@ -16,6 +16,8 @@ import boto3
 from openai import OpenAI
 from deep_translator import GoogleTranslator
 import replicate
+from urllib.parse import urlparse, parse_qs
+import math
 # Load environment variables from .env file
 load_dotenv()
 
@@ -31,6 +33,9 @@ youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 openai_api_key = os.getenv("OPENAI_API_KEY")
 replicate_api_url = os.getenv("REPLICATE_API_URL")
+YOUTUBE_PLAYLIST_ITEMS_API = "https://www.googleapis.com/youtube/v3/playlistItems"
+YOUTUBE_VIDEO_API = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_PLAYLIST_API = "https://www.googleapis.com/youtube/v3/playlists"
 
 client = OpenAI(api_key=openai_api_key)
 genai.configure(api_key=gemini_api_key)
@@ -448,29 +453,42 @@ def clip_and_combine_video(video_name, transcription):
     print("Clipping and combining video segments...")
     try:
         clip = VideoFileClip(video_name)
+        video_duration = clip.duration  # Get total duration
         subclips = []
+
+        # Get the last valid timestamp and floor it
+        if transcription:
+            last_valid_timestamp = transcription[-1]["end_time"]
+            last_valid_seconds = sum(
+                int(x) * 60 ** i for i, x in enumerate(reversed(last_valid_timestamp.split(":"))))
+            # Ensure it's within range
+            last_valid_seconds = max(0, math.floor(last_valid_seconds) - 1)
+
         for timestamp in transcription:
             start_time = timestamp["start_time"]
             end_time = timestamp["end_time"]
+
             start_seconds = sum(int(x) * 60 ** i for i,
                                 x in enumerate(reversed(start_time.split(":"))))
             end_seconds = sum(int(x) * 60 ** i for i,
                               x in enumerate(reversed(end_time.split(":"))))
+
+            # If end_seconds exceeds video duration, floor and subtract 1 second
+            if end_seconds > video_duration:
+                print(
+                    f"End time {end_seconds} exceeds video duration {video_duration}. Adjusting to {last_valid_seconds}.")
+                end_seconds = last_valid_seconds
+
+            if start_seconds >= end_seconds:  # Avoid invalid cases
+                print(
+                    f"Skipping invalid clip: start {start_seconds}, end {end_seconds}")
+                continue
+
             subclip = clip.subclip(start_seconds, end_seconds)
             subclips.append(subclip)
-        combined_clip = concatenate_videoclips(subclips)
-        clipped_video_name = f"{video_name}_clipped.mp4"
-        combined_clip.write_videofile(
-            clipped_video_name,
-            codec="libx264",
-            preset="ultrafast",
-            threads=os.cpu_count(),
-            ffmpeg_params=["-bufsize", "500M"],
-            bitrate="1M",
-            logger=None  # Disables progress bar
-        )
+
         print("Video clipping and combining completed.")
-        return clipped_video_name
+        return subclips
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to clip and combine video {str(e)}")
@@ -548,6 +566,65 @@ def convert_transcription(transcription, language_code):
         return False
 
 
+def check_youtube_ids(url):
+    try:
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query)
+
+        video_id = query_params.get("v", [None])[0]
+        if video_id:
+            # Check if the video is valid
+            params = {
+                "part": "id",
+                "id": video_id,
+                "key": youtube_api_key
+            }
+            response = requests.get(YOUTUBE_VIDEO_API, params=params).json()
+            if "items" in response and len(response["items"]) > 0:
+                return [video_id]
+            return []
+
+        playlist_id = query_params.get("list", [None])[0]
+        if playlist_id:
+            # Check if the playlist is valid
+            params = {
+                "part": "id",
+                "id": playlist_id,
+                "key": youtube_api_key
+            }
+            response = requests.get(YOUTUBE_PLAYLIST_API, params=params).json()
+            if "items" in response and len(response["items"]) > 0:
+                video_ids = []
+                next_page_token = None
+
+                while True:
+                    params = {
+                        "part": "snippet",
+                        "playlistId": playlist_id,
+                        "maxResults": 50,
+                        "key": youtube_api_key,
+                        "pageToken": next_page_token,
+                    }
+                    response = requests.get(
+                        YOUTUBE_PLAYLIST_ITEMS_API, params=params).json()
+
+                    for item in response.get("items", []):
+                        vid_id = item["snippet"]["resourceId"]["videoId"]
+                        video_ids.append(vid_id)
+
+                    next_page_token = response.get("nextPageToken")
+                    if not next_page_token:
+                        break
+
+                return video_ids
+
+        return []
+
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        return []
+
+
 class VideoRequest(BaseModel):
     prompt_link: str
     prompt: str
@@ -557,56 +634,80 @@ class VideoRequest(BaseModel):
 async def process_video(video_request: VideoRequest):
     video_url = video_request.prompt_link
     user_prompt = video_request.prompt
-    video_id = get_video_id(video_url)
+    video_clips = []
+    video_details = []
+    video_ids = check_youtube_ids(video_url)
 
-    video_details = get_video_details(video_id)
-    if not video_details:
-        return {"status_code": 404, "message": "Video not found", "error_code": "VNF"}
+    if not video_ids:
+        return {"status_code": 404, "message": "Video not found", "error_code": "TNF"}
+    for video_id in video_ids:
 
-    transcription = []
-    transcription_with_index = []
-    language_code = "en"
+        video_detail = get_video_details(video_id)
+        transcription = []
+        transcription_with_index = []
+        language_code = "en"
 
-    transcription_object = get_transcription_with_index(
-        video_id)
+        transcription_object = get_transcription_with_index(
+            video_id)
 
-    if transcription_object["transcription"]:
-        transcription = transcription_object["transcription"]
-        transcription_with_index = transcription_object["transcription_with_index"]
-
-    if not transcription_object["transcription"]:
-        language_code = get_another_transcription_language_code(video_id)
-        if language_code:
-            transcription_object = get_transcription_with_index(
-                video_id, language_code)
+        if transcription_object["transcription"]:
             transcription = transcription_object["transcription"]
             transcription_with_index = transcription_object["transcription_with_index"]
-        else:
-            audio_name = download_audio(video_id)
-            if not audio_name:
-                return {"status_code": 500, "message": "Failed to fetch audio.", "error_code": "FFA"}
-            transcription_object = create_transcription_with_index_using_replicate(
-                audio_name)
-            transcription = transcription_object["transcription"]
-            transcription_with_index = transcription_object["transcription_with_index"]
-            language_code = transcription_object["language_code"]
-            if not transcription:
-                return {"status_code": 500, "message": "Failed to generate transcription.", "error_code": "FGT"}
 
-    user_prompt_with_transcription = get_prompt(
-        transcription_with_index, user_prompt, language_code)
-    print(user_prompt_with_transcription)
-    index_array = filter_using_gemini(
-        user_prompt_with_transcription)
-    if not index_array:
-        return {"status_code": 404, "message": "Transcription not found", "error_code": "TNF"}
-    transcription = group_transcription_with_index(transcription, index_array)
-    video_name = download_video(video_id)
-    final_video_name = clip_and_combine_video(video_name, transcription)
-    video_link = create_video_link(final_video_name)
-    return {
-        "id": video_details["id"],
-        "title": video_details["title"],
-        "video_link": video_link,
-        "transcription": transcription,
-    }
+        if not transcription_object["transcription"]:
+            language_code = get_another_transcription_language_code(video_id)
+            if language_code:
+                transcription_object = get_transcription_with_index(
+                    video_id, language_code)
+                transcription = transcription_object["transcription"]
+                transcription_with_index = transcription_object["transcription_with_index"]
+            else:
+                audio_name = download_audio(video_id)
+                if not audio_name:
+                    continue
+                transcription_object = create_transcription_with_index_using_replicate(
+                    audio_name)
+                transcription = transcription_object["transcription"]
+                transcription_with_index = transcription_object["transcription_with_index"]
+                language_code = transcription_object["language_code"]
+                if not transcription:
+                    continue
+
+        user_prompt_with_transcription = get_prompt(
+            transcription_with_index, user_prompt, language_code)
+        print(user_prompt_with_transcription)
+        index_array = filter_using_gemini(
+            user_prompt_with_transcription)
+        if not index_array:
+            continue
+        transcription = group_transcription_with_index(
+            transcription, index_array)
+        video_name = download_video(video_id)
+        video_clip = clip_and_combine_video(video_name, transcription)
+        video_clips += video_clip
+        video_details.append({
+            "id": video_detail["id"],
+            "title": video_detail["title"],
+            "transcription": transcription,
+        })
+    try:
+        combined_clip = concatenate_videoclips(video_clips)
+    except Exception as e:
+        print("concatination failed", str(e), video_clips)
+        return {"status_code": 500, "message": "Video merging failed", "error_code": "TNF"}
+
+    video_name = "final_"+get_random_name_with("mp4")
+    print("Writing file to local...")
+    combined_clip.write_videofile(
+        video_name,
+        codec="libx264",
+        preset="ultrafast",
+        threads=os.cpu_count(),
+        ffmpeg_params=["-bufsize", "500M"],
+        bitrate="1M",
+        logger=None  # Disables progress bar
+    )
+    print("Writing completed!")
+
+    video_link = create_video_link(video_name)
+    return {"video_link": video_link, "video_details": video_details}
