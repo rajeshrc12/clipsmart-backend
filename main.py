@@ -637,31 +637,16 @@ async def process_video(video_request: VideoRequest):
         transcription_with_index = []
         language_code = "en"
 
-        transcription_object = get_transcription_with_index(
-            video_id)
-
-        if transcription_object["transcription"]:
-            transcription = transcription_object["transcription"]
-            transcription_with_index = transcription_object["transcription_with_index"]
-
-        if not transcription_object["transcription"]:
-            language_code = get_another_transcription_language_code(video_id)
-            if language_code:
-                transcription_object = get_transcription_with_index(
-                    video_id, language_code)
-                transcription = transcription_object["transcription"]
-                transcription_with_index = transcription_object["transcription_with_index"]
-            else:
-                audio_name = download_audio(video_id)
-                if not audio_name:
-                    continue
-                transcription_object = create_transcription_with_index_using_replicate(
-                    audio_name)
-                transcription = transcription_object["transcription"]
-                transcription_with_index = transcription_object["transcription_with_index"]
-                language_code = transcription_object["language_code"]
-                if not transcription:
-                    continue
+        audio_name = download_audio(video_id)
+        if not audio_name:
+            continue
+        transcription_object = create_transcription_with_index_using_openai(
+            audio_name)
+        transcription = transcription_object["transcription"]
+        transcription_with_index = transcription_object["transcription_with_index"]
+        language_code = transcription_object["language_code"]
+        if not transcription:
+            continue
 
         user_prompt_with_transcription = get_prompt(
             transcription_with_index, user_prompt, language_code)
