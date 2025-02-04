@@ -1,5 +1,4 @@
 fastapi
-uvicorn
 python-dotenv
 pydantic
 requests
@@ -8,3 +7,6 @@ google-generativeai
 yt-dlp
 moviepy==1.0.3
 boto3
+openai
+deep-translator
+replicate
