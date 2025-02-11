@@ -16,6 +16,7 @@ from openai import OpenAI
 from deep_translator import GoogleTranslator
 import replicate
 from urllib.parse import urlparse, parse_qs
+import re
 # Load environment variables from .env file
 load_dotenv()
 
@@ -100,26 +101,53 @@ def get_video_id(video_url):
     print("Video ID extracted successfully.")
     return result
 
+def parse_duration(iso_duration):
+    """Convert ISO 8601 duration format (e.g., PT2M8S) to hh:mm:ss format."""
+    pattern = r'PT(\d+H)?(\d+M)?(\d+S)?'
+    match = re.match(pattern, iso_duration)
+    
+    hours = match.group(1)
+    minutes = match.group(2)
+    seconds = match.group(3)
+
+    hours = int(hours[:-1]) if hours else 0
+    minutes = int(minutes[:-1]) if minutes else 0
+    seconds = int(seconds[:-1]) if seconds else 0
+    
+    # Format the result as hh:mm:ss
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 def get_video_details(video_id):
     print("Fetching video details from YouTube API...")
     try:
-        url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={video_id}&key={youtube_api_key}"
+        # Modify the API URL to include both snippet and contentDetails
+        url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id={video_id}&key={youtube_api_key}"
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
+        
+        # Check if the video exists
         if not data["items"]:
             global_error.append(f"error while fetching video details, video id:{video_id} error: video not found or private")
             return False
+        
         video_snippet = data["items"][0]["snippet"]
+        video_content_details = data["items"][0]["contentDetails"]
+        
+        # Extract title and duration
+        title = video_snippet["title"]
+        duration = video_content_details["duration"]  # ISO 8601 format
+        
         result = {
             "id": video_id,
-            "title": video_snippet["title"],
+            "title": title,
+            "duration": parse_duration(duration),
         }
+        
         print("Video details fetched successfully.")
         return result
     except Exception as e:
-        print("Failed to fetch video details",str(e))
+        print("Failed to fetch video details:", str(e))
         global_error.append(f"error while fetching video details, video id:{video_id} error: {str(e)}")
         return False
 
@@ -166,7 +194,7 @@ def get_transcription(video_id):
                     end = next_start  # Adjust end time to match next start
 
             fixed_transcript.append(
-                {'text': entry['text'], 'start_time': start, 'end_time': end, "start": entry['start'], "duration": duration})
+                {'text': entry['text'], 'start_time': seconds_to_hhmmss(start), 'end_time': seconds_to_hhmmss(end), "start": start,"end":end, "duration": duration})
         print("Retrieving transcription complete")
         return fixed_transcript
     except Exception as e:
@@ -687,15 +715,6 @@ return output only in array of object.
     index_array = filter_using_openai(
         prompt)
     print(index_array)
-#     print(videos)
-#     with open("videos.json", "w") as file:
-#         json.dump(videos, file, indent=4)  # `indent=4` for pretty formatting
-#     with open("index_array.json", "w") as file:
-#         json.dump(index_array, file, indent=4)  # `indent=4` for pretty formatting
-    # with open("videos.json", "r") as file:
-    #     videos = json.load(file)
-    # with open("index_array.json", "r") as file:
-    #     index_array = json.load(file)
     final_transcription = []
     try:
         for item in index_array:
@@ -704,6 +723,8 @@ return output only in array of object.
                     video_index_integer=int(video_index)-1
                     video_detail = {"title": videos[video_index_integer]["title"], 
                                     "id": videos[video_index_integer]["id"], 
+                                    "duration": videos[video_index_integer]["duration"], 
+                                    "all_transcription": videos[video_index_integer]["transcription"], 
                                     "transcription": []}
                     try:
                         for transcription_index_with_video_index in transcription_index_with_video_index_array:
@@ -722,4 +743,9 @@ return output only in array of object.
                 continue
     except Exception as e:
         print(str(e))
-    return {"video_link": "", "video_details": final_transcription,"global_error":global_error}
+
+    for video in final_transcription:
+        transcription = group_transcription(video["transcription"])
+        video["transcription"] = transcription
+    
+    return {"video_link": "", "video_details":final_transcription,"global_error":global_error}
